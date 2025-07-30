@@ -1,0 +1,4 @@
+_ignore_
+_background_
+dragon
+people

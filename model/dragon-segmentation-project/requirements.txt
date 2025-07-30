@@ -1,0 +1,5 @@
+conda create -n dragon_segmentation python=3.8
+conda activate dragon_segmentation
+pip install torch torchvision torchaudio  # 如果使用PyTorch
+pip install tensorflow  # 如果使用TensorFlow
+pip install opencv-python  # 用于视频处理

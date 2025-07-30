@@ -1,0 +1,496 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import List, Dict, Optional, Tuple
+import cv2
+import numpy as np
+from mamba_ssm import Mamba
+from transformers import AutoModel, AutoProcessor
+
+class DragonSegmentationHybrid(nn.Module):
+    """SAM2 + UMamba混合架构用于舞龙分割"""
+    
+    def __init__(self, 
+                 sam2_model_name="facebook/sam2-hiera-large",
+                 input_size=(1024, 1024),
+                 num_frames=8,
+                 mamba_dim=256):
+        super().__init__()
+        
+        # SAM2组件 - 用于特征提取和初始分割
+        self.sam2_encoder = SAM2FeatureExtractor(sam2_model_name)
+        self.sam2_decoder = SAM2Decoder()
+        
+        # UMamba组件 - 用于时序建模和精细分割
+        self.temporal_mamba = TemporalMambaProcessor(mamba_dim, num_frames)
+        self.spatial_mamba = SpatialMambaRefiner(mamba_dim)
+        
+        # 舞龙专用模块
+        self.dragon_attention = DragonSpecificAttention(mamba_dim)
+        self.motion_tracker = DragonMotionTracker()
+        
+        # 融合层
+        self.feature_fusion = MultiModalFusion(mamba_dim)
+        self.final_decoder = DragonSegmentationHead(mamba_dim, num_classes=2)
+        
+        self.input_size = input_size
+        self.num_frames = num_frames
+
+class SAM2FeatureExtractor(nn.Module):
+    """SAM2特征提取器 - 利用预训练优势"""
+    
+    def __init__(self, model_name):
+        super().__init__()
+        self.sam2_model = AutoModel.from_pretrained(model_name)
+        self.processor = AutoProcessor.from_pretrained(model_name)
+        
+        # 冻结大部分SAM2参数，只微调最后几层
+        self._freeze_backbone()
+        
+    def _freeze_backbone(self):
+        """冻结SAM2主干网络"""
+        for name, param in self.sam2_model.named_parameters():
+            if 'vision_encoder' in name:
+                # 只允许最后两个transformer块可训练
+                if 'blocks.10' in name or 'blocks.11' in name:
+                    param.requires_grad = True
+                else:
+                    param.requires_grad = False
+            else:
+                param.requires_grad = True
+    
+    def forward(self, images):
+        """
+        Args:
+            images: (B, T, C, H, W) 视频帧序列
+        Returns:
+            features: 多尺度特征图
+        """
+        B, T, C, H, W = images.shape
+        
+        # 逐帧提取SAM2特征
+        frame_features = []
+        for t in range(T):
+            # SAM2特征提取
+            inputs = self.processor(images[:, t], return_tensors="pt")
+            with torch.no_grad():
+                outputs = self.sam2_model.vision_encoder(inputs.pixel_values)
+            
+            # 获取多尺度特征
+            features = {
+                'low': outputs.hidden_states[4],   # 低级特征
+                'mid': outputs.hidden_states[8],   # 中级特征  
+                'high': outputs.hidden_states[-1]  # 高级特征
+            }
+            frame_features.append(features)
+        
+        return frame_features
+
+class TemporalMambaProcessor(nn.Module):
+    """时序Mamba处理器 - 建模龙体运动"""
+    
+    def __init__(self, dim, num_frames, d_state=16):
+        super().__init__()
+        self.num_frames = num_frames
+        
+        # 多尺度时序Mamba
+        self.temporal_mamba_low = Mamba(d_model=dim, d_state=d_state)
+        self.temporal_mamba_mid = Mamba(d_model=dim, d_state=d_state)
+        self.temporal_mamba_high = Mamba(d_model=dim, d_state=d_state)
+        
+        # 特征对齐层
+        self.feature_align = nn.ModuleDict({
+            'low': nn.Conv2d(384, dim, 1),   # SAM2低级特征通道数
+            'mid': nn.Conv2d(768, dim, 1),   # SAM2中级特征通道数
+            'high': nn.Conv2d(1024, dim, 1)  # SAM2高级特征通道数
+        })
+        
+        # 位置编码
+        self.temporal_pos_embed = nn.Parameter(torch.randn(num_frames, dim))
+        
+    def forward(self, frame_features):
+        """
+        Args:
+            frame_features: List[Dict] 每帧的多尺度特征
+        Returns:
+            temporal_features: 时序建模后的特征
+        """
+        temporal_features = {}
+        
+        for scale in ['low', 'mid', 'high']:
+            # 收集所有帧的同尺度特征
+            scale_features = []
+            for t, frame_feat in enumerate(frame_features):
+                feat = frame_feat[scale]  # (B, C, H, W)
+                feat = self.feature_align[scale](feat)  # 统一通道数
+                
+                # 添加时序位置编码
+                B, C, H, W = feat.shape
+                feat_flat = feat.flatten(2).transpose(1, 2)  # (B, H*W, C)
+                pos_embed = self.temporal_pos_embed[t].unsqueeze(0).unsqueeze(0)
+                feat_flat = feat_flat + pos_embed
+                
+                scale_features.append(feat_flat)
+            
+            # 堆叠时序维度 (B, T*H*W, C)
+            temporal_seq = torch.cat(scale_features, dim=1)
+            
+            # Mamba时序建模
+            if scale == 'low':
+                temporal_out = self.temporal_mamba_low(temporal_seq)
+            elif scale == 'mid':
+                temporal_out = self.temporal_mamba_mid(temporal_seq)
+            else:
+                temporal_out = self.temporal_mamba_high(temporal_seq)
+            
+            # 重塑回空间维度
+            chunk_size = temporal_out.shape[1] // self.num_frames
+            temporal_frames = temporal_out.chunk(self.num_frames, dim=1)
+            
+            restored_frames = []
+            for i, (frame_feat, chunk) in enumerate(zip(frame_features, temporal_frames)):
+                original_shape = frame_feat[scale].shape[2:]  # (H, W)
+                restored = chunk.transpose(1, 2).view(
+                    chunk.shape[0], -1, *original_shape
+                )
+                restored_frames.append(restored)
+            
+            temporal_features[scale] = restored_frames
+        
+        return temporal_features
+
+class SpatialMambaRefiner(nn.Module):
+    """空间Mamba精细化器 - 处理龙体复杂形状"""
+    
+    def __init__(self, dim):
+        super().__init__()
+        
+        # 多方向空间Mamba
+        self.horizontal_mamba = Mamba(d_model=dim, d_state=16)
+        self.vertical_mamba = Mamba(d_model=dim, d_state=16)
+        self.diagonal_mamba = Mamba(d_model=dim, d_state=16)
+        
+        # 方向融合
+        self.direction_fusion = nn.Conv2d(dim * 3, dim, 1)
+        self.norm = nn.LayerNorm(dim)
+        
+    def forward(self, features):
+        """
+        Args:
+            features: (B, C, H, W) 单帧特征
+        Returns:
+            refined_features: 空间精细化后的特征
+        """
+        B, C, H, W = features.shape
+        
+        # 水平扫描
+        h_scan = features.flatten(2).transpose(1, 2)  # (B, H*W, C)
+        h_refined = self.horizontal_mamba(h_scan)
+        h_refined = h_refined.transpose(1, 2).view(B, C, H, W)
+        
+        # 垂直扫描
+        v_scan = features.transpose(2, 3).flatten(2).transpose(1, 2)
+        v_refined = self.vertical_mamba(v_scan)
+        v_refined = v_refined.transpose(1, 2).view(B, C, W, H).transpose(2, 3)
+        
+        # 对角扫描 (简化版)
+        d_scan = features.flatten(2).transpose(1, 2)
+        d_refined = self.diagonal_mamba(d_scan)
+        d_refined = d_refined.transpose(1, 2).view(B, C, H, W)
+        
+        # 融合多方向信息
+        fused = torch.cat([h_refined, v_refined, d_refined], dim=1)
+        refined = self.direction_fusion(fused)
+        
+        # 残差连接
+        refined = refined + features
+        refined = self.norm(refined.flatten(2).transpose(1, 2)).transpose(1, 2).view(B, C, H, W)
+        
+        return refined
+
+class DragonSpecificAttention(nn.Module):
+    """舞龙专用注意力机制"""
+    
+    def __init__(self, dim):
+        super().__init__()
+        
+        # 龙体形状先验
+        self.shape_attention = nn.MultiheadAttention(dim, num_heads=8)
+        
+        # 运动一致性注意力
+        self.motion_attention = nn.MultiheadAttention(dim, num_heads=8)
+        
+        # 颜色特征注意力 (红色、金色等龙的典型颜色)
+        self.color_attention = ColorAwareAttention(dim)
+        
+        self.fusion = nn.Linear(dim * 3, dim)
+        
+    def forward(self, features, motion_info=None):
+        """
+        Args:
+            features: (B, C, H, W) 特征图
+            motion_info: 运动信息 (可选)
+        """
+        B, C, H, W = features.shape
+        feat_seq = features.flatten(2).transpose(1, 2)  # (B, H*W, C)
+        
+        # 形状注意力
+        shape_out, _ = self.shape_attention(feat_seq, feat_seq, feat_seq)
+        
+        # 运动注意力
+        motion_out, _ = self.motion_attention(feat_seq, feat_seq, feat_seq)
+        
+        # 颜色注意力
+        color_out = self.color_attention(features)
+        color_seq = color_out.flatten(2).transpose(1, 2)
+        
+        # 融合
+        fused = torch.cat([shape_out, motion_out, color_seq], dim=-1)
+        output = self.fusion(fused)
+        
+        return output.transpose(1, 2).view(B, C, H, W)
+
+class ColorAwareAttention(nn.Module):
+    """颜色感知注意力 - 针对龙的典型颜色"""
+    
+    def __init__(self, dim):
+        super().__init__()
+        
+        # 预定义龙的典型颜色范围 (HSV)
+        self.register_buffer('dragon_colors', torch.tensor([
+            [0, 10, 100, 255, 100, 255],    # 红色范围
+            [15, 25, 100, 255, 100, 255],   # 金色范围
+            [45, 65, 100, 255, 100, 255],   # 黄色范围
+        ]))
+        
+        self.color_proj = nn.Conv2d(3, dim, 1)
+        self.attention_conv = nn.Conv2d(dim, 1, 1)
+        
+    def forward(self, features):
+        """基于颜色信息生成注意力权重"""
+        B, C, H, W = features.shape
+        
+        # 简化的颜色注意力计算
+        color_feat = self.color_proj(features[:, :3])  # 假设前3通道是RGB
+        attention_map = torch.sigmoid(self.attention_conv(color_feat))
+        
+        return features * attention_map
+
+class DragonMotionTracker(nn.Module):
+    """龙体运动追踪器"""
+    
+    def __init__(self):
+        super().__init__()
+        
+        # 光流估计网络 (简化版)
+        self.flow_estimator = nn.Sequential(
+            nn.Conv2d(6, 64, 7, padding=3),  # 两帧拼接
+            nn.ReLU(),
+            nn.Conv2d(64, 32, 5, padding=2),
+            nn.ReLU(),
+            nn.Conv2d(32, 2, 3, padding=1)   # 输出光流
+        )
+        
+    def forward(self, frame1, frame2):
+        """估计两帧间的运动"""
+        concatenated = torch.cat([frame1, frame2], dim=1)
+        flow = self.flow_estimator(concatenated)
+        return flow
+
+class MultiModalFusion(nn.Module):
+    """多模态特征融合"""
+    
+    def __init__(self, dim):
+        super().__init__()
+        
+        self.sam2_proj = nn.Conv2d(dim, dim, 1)
+        self.mamba_proj = nn.Conv2d(dim, dim, 1)
+        
+        self.fusion_conv = nn.Sequential(
+            nn.Conv2d(dim * 2, dim, 3, padding=1),
+            nn.BatchNorm2d(dim),
+            nn.ReLU(),
+            nn.Conv2d(dim, dim, 1)
+        )
+        
+        self.attention = nn.Sequential(
+            nn.Conv2d(dim, dim // 4, 1),
+            nn.ReLU(),
+            nn.Conv2d(dim // 4, 2, 1),
+            nn.Softmax(dim=1)
+        )
+        
+    def forward(self, sam2_features, mamba_features):
+        """融合SAM2和Mamba特征"""
+        sam2_proj = self.sam2_proj(sam2_features)
+        mamba_proj = self.mamba_proj(mamba_features)
+        
+        # 计算注意力权重
+        concat_feat = torch.cat([sam2_proj, mamba_proj], dim=1)
+        attention_weights = self.attention(concat_feat)
+        
+        # 加权融合
+        weighted_sam2 = sam2_proj * attention_weights[:, 0:1]
+        weighted_mamba = mamba_proj * attention_weights[:, 1:2]
+        
+        fused = self.fusion_conv(torch.cat([weighted_sam2, weighted_mamba], dim=1))
+        
+        return fused
+
+class DragonSegmentationHead(nn.Module):
+    """龙体分割输出头"""
+    
+    def __init__(self, dim, num_classes=2):
+        super().__init__()
+        
+        self.decoder = nn.Sequential(
+            nn.Conv2d(dim, dim // 2, 3, padding=1),
+            nn.BatchNorm2d(dim // 2),
+            nn.ReLU(),
+            nn.ConvTranspose2d(dim // 2, dim // 4, 2, stride=2),
+            nn.BatchNorm2d(dim // 4),
+            nn.ReLU(),
+            nn.ConvTranspose2d(dim // 4, dim // 8, 2, stride=2),
+            nn.BatchNorm2d(dim // 8),
+            nn.ReLU(),
+            nn.Conv2d(dim // 8, num_classes, 1)
+        )
+        
+        # 边缘增强
+        self.edge_enhancer = EdgeEnhancementModule(dim // 8)
+        
+    def forward(self, features):
+        decoded = self.decoder(features)
+        enhanced = self.edge_enhancer(decoded)
+        return enhanced
+
+class EdgeEnhancementModule(nn.Module):
+    """边缘增强模块 - 提升龙体边界精度"""
+    
+    def __init__(self, channels):
+        super().__init__()
+        
+        # Sobel算子
+        self.register_buffer('sobel_x', torch.tensor([
+            [[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]]
+        ]).float().unsqueeze(0))
+        
+        self.register_buffer('sobel_y', torch.tensor([
+            [[-1, -2, -1], [0, 0, 0], [1, 2, 1]]
+        ]).float().unsqueeze(0))
+        
+        self.edge_conv = nn.Conv2d(channels + 2, channels, 3, padding=1)
+        
+    def forward(self, x):
+        # 计算边缘
+        edges_x = F.conv2d(x.mean(dim=1, keepdim=True), 
+                          self.sobel_x, padding=1)
+        edges_y = F.conv2d(x.mean(dim=1, keepdim=True), 
+                          self.sobel_y, padding=1)
+        
+        # 融合边缘信息
+        enhanced = torch.cat([x, edges_x, edges_y], dim=1)
+        output = self.edge_conv(enhanced)
+        
+        return output + x  # 残差连接
+
+
+
+
+训练管道
+class HybridDragonTrainer:
+    def __init__(self, model, config):
+        self.model = model
+        self.config = config
+        
+        # 分阶段训练策略
+        self.training_phases = {
+            'phase1': self._phase1_sam2_adaptation,
+            'phase2': self._phase2_mamba_training, 
+            'phase3': self._phase3_joint_finetuning
+        }
+        
+    def _phase1_sam2_adaptation(self, train_loader):
+        """阶段1: SAM2适应性训练"""
+        # 只训练SAM2的最后几层
+        for name, param in self.model.named_parameters():
+            if 'sam2' in name and ('blocks.10' in name or 'blocks.11' in name):
+                param.requires_grad = True
+            else:
+                param.requires_grad = False
+                
+    def _phase2_mamba_training(self, train_loader):
+        """阶段2: Mamba组件训练"""
+        # 冻结SAM2，训练Mamba部分
+        for name, param in self.model.named_parameters():
+            if 'mamba' in name or 'dragon' in name:
+                param.requires_grad = True
+            else:
+                param.requires_grad = False
+                
+    def _phase3_joint_finetuning(self, train_loader):
+        """阶段3: 联合微调"""
+        # 端到端微调整个模型
+        for param in self.model.parameters():
+            param.requires_grad = True
+            
+    def train(self, train_loader, val_loader):
+        """完整训练流程"""
+        for phase_name, phase_func in self.training_phases.items():
+            print(f"开始{phase_name}训练...")
+            phase_func(train_loader)
+            # 执行训练循环
+            self._train_epoch(train_loader, val_loader)
+
+
+
+
+
+
+
+推理管道
+class DragonVideoProcessor:
+    def __init__(self, model_path):
+        self.model = DragonSegmentationHybrid()
+        self.model.load_state_dict(torch.load(model_path))
+        self.model.eval()
+        
+    def process_video(self, video_path, output_path):
+        """处理完整视频"""
+        cap = cv2.VideoCapture(video_path)
+        writer = None
+        
+        frame_buffer = []
+        results = []
+        
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+                
+            frame_buffer.append(frame)
+            
+            # 批处理模式
+            if len(frame_buffer) == self.model.num_frames:
+                batch_result = self._process_frame_batch(frame_buffer)
+                results.extend(batch_result)
+                
+                # 滑窗处理
+                frame_buffer = frame_buffer[self.model.num_frames//2:]
+        
+        # 保存结果视频
+        self._save_video(results, output_path)
+        
+    def _process_frame_batch(self, frames):
+        """批处理帧序列"""
+        with torch.no_grad():
+            # 预处理
+            processed_frames = self._preprocess_frames(frames)
+            
+            # 模型推理
+            masks = self.model(processed_frames)
+            
+            # 后处理
+            results = self._postprocess_masks(masks, frames)
+            
+        return results
