@@ -46,7 +46,6 @@
 **传承文化，智创未来 | Inherit Culture, Create with Intelligence**
 
 ![Visitor Count](https://visitor-badge.laobi.icu/badge?page_id=yourusername.dragon-dance-ai)
-[![GitHub followers](https://img.shields.io/github/followers/yourusername?style=social)](https://github.com/yourusername)
 
 </div>
 
